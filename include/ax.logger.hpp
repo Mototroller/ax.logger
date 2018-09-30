@@ -2,9 +2,9 @@
 #define AX_LOGGER_HPP
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <chrono>
-#include <climits>
 #include <condition_variable>
 #include <cstring>
 #include <deque>
@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <ios>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <regex>
@@ -25,11 +26,7 @@
 
 namespace Ax { namespace Logger {
     
-    using size_t = std::size_t;
-    using ByteType = unsigned char;
-    
-    
-    enum class LEVEL : ByteType {
+    enum class LEVEL : unsigned char {
         TRACE,
         DEBUG,
         INFO,
@@ -40,10 +37,10 @@ namespace Ax { namespace Logger {
     };
     
     inline bool operator<(LEVEL lh, LEVEL rh) {
-        return static_cast<ByteType>(lh) < static_cast<ByteType>(rh); }
+        return static_cast<unsigned char>(lh) < static_cast<unsigned char>(rh); }
     
     inline bool operator<=(LEVEL lh, LEVEL rh) {
-        return static_cast<ByteType>(lh) <= static_cast<ByteType>(rh); }
+        return static_cast<unsigned char>(lh) <= static_cast<unsigned char>(rh); }
     
     inline std::ostream& operator<<(std::ostream& os, LEVEL lvl) {
         switch(lvl) {
@@ -62,8 +59,8 @@ namespace Ax { namespace Logger {
     
     inline std::istream& operator>>(std::istream& is, LEVEL& lvl) {
         static const std::unordered_map<std::string, LEVEL> strToLvl{
-            {"ALL",     LEVEL::TRACE},
             {"TRACE",   LEVEL::TRACE},
+            {"ALL",     LEVEL::TRACE},
             {"DEBUG",   LEVEL::DEBUG},
             {"INFO",    LEVEL::INFO},
             {"WARN",    LEVEL::WARN},
@@ -116,8 +113,14 @@ namespace Ax { namespace Logger {
     
     namespace detail {
         
+        using size_t = std::size_t;
+        using ByteType = unsigned char;
+        
+        
         /// Abstract interface used while deserialization
         struct VirtualCodec {
+            virtual ~VirtualCodec() = default;
+            
             virtual size_t alignment() const = 0;
             virtual size_t deserialize(const void*, std::ostream&) const = 0;
             
@@ -159,7 +162,7 @@ namespace Ax { namespace Logger {
         template <class Codec>
         struct Initializer {
         private:
-            struct SpecificCodec : public VirtualCodec {
+            struct SpecificCodec final : VirtualCodec {
                 virtual size_t alignment() const override {
                     return Codec::alignment; }
                 
@@ -224,9 +227,6 @@ namespace Ax { namespace Logger {
             static constexpr bool is_streamable = decltype(probeS<T>(0))::value;
             static constexpr bool is_literal    = decltype(probeL<T>(0))::value;
             static constexpr bool is_scalar     = std::is_scalar<T>::value;
-            
-            static constexpr unsigned checksum = // mask with appropriate bit set
-                ((is_streamable << 2) + (is_literal << 1) + (is_scalar));
         };
         
         
@@ -243,13 +243,20 @@ namespace Ax { namespace Logger {
         };
         
         
-        /// Uses to mark failed log messages while serialization
-        struct FailTag {};
-        
-        
         /// Lightweight std::decay, removes reference and cv-qualifiers
         template <class T>
         using simplify_t = std::remove_cv_t<std::remove_reference_t<T>>;
+        
+        
+        class Spinlock {
+        public:
+            inline void lock()     { while(flag_.test_and_set(std::memory_order_acquire)); }
+            inline bool try_lock() { return !flag_.test_and_set(std::memory_order_acquire); }
+            inline void unlock()   { flag_.clear(std::memory_order_release); }
+            
+        private:
+            std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
+        };
         
     } //detail
     
@@ -468,8 +475,8 @@ namespace Ax { namespace Logger {
                 if(!align(dst, alignof(Header)))
                     return 0;
                 
-                auto idxPtr = new(dst) Header(typeid(detail::FailTag));
                 // TODO: Destructor<Header>(idxPtr)?
+                new(dst) Header(typeid(typename ArgCodec::type));
                 shift(dst, sizeof(Header));
                 
                 if(!align(dst, ArgCodec::alignment))
@@ -478,8 +485,6 @@ namespace Ax { namespace Logger {
                 auto written = ArgCodec::serialize(dst, std::forward<T>(arg));
                 shift(dst, written);
                 
-                // Serialization done, finalizing header:
-                *idxPtr = Header(typeid(typename ArgCodec::type));
                 return distance(begin, dst);
             }
             
@@ -492,9 +497,6 @@ namespace Ax { namespace Logger {
                 
                 auto idxPtr = static_cast<const Header*>(ptr);
                 detail::Destructor<Header> indexDtor(idxPtr);
-                if(*idxPtr == Header(typeid(detail::FailTag)))
-                    return 0;
-                
                 shift(ptr, sizeof(Header));
                 
                 auto vCodec = detail::CodecRegistry::getCodec(*idxPtr);
@@ -531,7 +533,7 @@ namespace Ax { namespace Logger {
                 bool ok = true;
                 
                 // Iterating through parameter pack:
-                std::initializer_list<int>{((
+                (void)std::initializer_list<int>{((
                     current = (ok ? serialize(dst, std::forward<T>(args)) : 0),
                     ok = (ok && current != 0),
                     shift(dst, current)
@@ -560,6 +562,8 @@ namespace Ax { namespace Logger {
         
         class LogTransport {
         public:
+            virtual ~LogTransport() = default;
+            
             virtual std::ostream& stream() = 0;
             virtual void flush() = 0;
         };
@@ -583,7 +587,7 @@ namespace Ax { namespace Logger {
                 size_t maxFileSizeMB    {100};
             };
             
-            RotatingFileTransport(const Config& cfg) :
+            explicit RotatingFileTransport(const Config& cfg) :
                 cfg_(cfg) { rotateFile(); }
             
             virtual std::ostream& stream() override {
@@ -609,8 +613,6 @@ namespace Ax { namespace Logger {
             void rotateFile() {
                 if(file_ && file_->is_open())
                     file_->close();
-                
-                // TODO: valgrind reports memory leak here
                 
                 auto timestamp = getUTCTimestamp();
                 std::string newName; newName
@@ -655,14 +657,14 @@ namespace Ax { namespace Logger {
                     return 0;
                 
                 std::streampos size = tmp.tellg();
-                return size;
+                return size_t(size);
             }
         };
         
         class TailFileTransport : public LogTransport {
             using Clock = std::chrono::steady_clock;
         public:
-            TailFileTransport(std::string fileName, std::chrono::milliseconds renewPeriod) :
+            TailFileTransport(const std::string& fileName, std::chrono::milliseconds renewPeriod) :
                 lastRenew_(Clock::now()), renewPeriod_(renewPeriod), fileName_(fileName)
             { rotateFile(); }
             
@@ -701,11 +703,6 @@ namespace Ax { namespace Logger {
         };
         
         
-        // Desired:
-        // LOG(TRACE) << "Ololo!" << 123;
-        // logger::print<TRACE>("Ololo! %%", 123);
-        // logger::stream<TRACE>() << "Ololo!" << 123;
-        
         /// Implementation
         class logAux {
             using SystemClock = std::chrono::system_clock;
@@ -715,22 +712,16 @@ namespace Ax { namespace Logger {
                 SystemClock::time_point timestamp;
                 std::thread::id threadId;
                 
-                char location[23] = {0};
-                LEVEL logLevel = LEVEL::OFF;
+                LEVEL logLevel      = LEVEL::OFF;
+                const char* fmtPtr  = nullptr; // TODO: serialize fmt?
+                size_t argsN        = 0;
                 
-                const char* fmtPtr = nullptr;
-                size_t argsN = 0;
-                
-                /// Beginning of payload: [h|arg1]...[h|arg2]...
+                /// Beginning of payload: [h|location]...[h|arg1]...[h|arg2]...
                 std::aligned_storage_t<1, alignof(std::type_index)> data;
                 
                 
-                LogEntry(SystemClock::time_point when, const char* where, LEVEL lvl) :
-                    timestamp(when), threadId(std::this_thread::get_id()), logLevel(lvl)
-                {
-                    auto size = std::min(sizeof(location) - 1, std::strlen(where));
-                    std::memcpy(location, where, size);
-                }
+                LogEntry(SystemClock::time_point when, LEVEL lvl) :
+                    timestamp(when), threadId(std::this_thread::get_id()), logLevel(lvl) {}
             };
             
             /// POD single unit for LogEntry placing
@@ -739,39 +730,10 @@ namespace Ax { namespace Logger {
             /// Unit holding aligned PODs
             using StorageUnit = std::unique_ptr<PodEntry[]>;
             
-            /// Invisible proxy, prints message to log at d-tor
-            template <LEVEL lvl>
-            class ProxyStream { friend class logAux;
-            public:
-                ProxyStream(ProxyStream&& rh) :
-                    this_(rh.this_), location_(rh.location_)
-                {
-                    acc_.swap(rh.acc_);
-                    rh.this_ = nullptr;
-                }
-                
-                ~ProxyStream() {
-                    if(this_)
-                        this_->print<lvl>(location_.c_str(), "%%", acc_.str());
-                }
-                
-                template <class T>
-                std::ostream& operator<<(const T& obj) {
-                    return acc_ << obj; }
-                
-            private:
-                ProxyStream(logAux* out, const std::string& location) :
-                    this_(out), location_(location) {}
-                
-                logAux* this_;
-                std::string location_;
-                std::ostringstream acc_;
-            };
-            
         public:
             struct Config { std::chrono::milliseconds flushPeriod{500}; };
             
-            logAux(const Config& cfg) :
+            explicit logAux(const Config& cfg) :
                 // NOTE: force ThreadName::Registry construction
                 cfg_((ThreadName::getName(std::this_thread::get_id()), cfg)),
                 fmtSpec_(
@@ -820,22 +782,24 @@ namespace Ax { namespace Logger {
                 cv_.notify_one();
             }
             
-            template <LEVEL lvl = LEVEL::TRACE, size_t fmtSize, class... Args>
-            void print(const char* location, const char (&fmt)[fmtSize], Args&&... args) {
+            template <LEVEL lvl = LEVEL::TRACE, class Location, size_t fmtSize, class... Args>
+            void print(Location&& location, const char (&fmt)[fmtSize], Args&&... args) {
                 if(lvl < logLevel_.load(std::memory_order_acquire))
                     return;
                 
                 auto now = SystemClock::now();
-                auto argsSize = MetaCodec::totalSize(args...);
+                auto argsSize = MetaCodec::totalSize(location, args...);
                 
-                auto unit = makeUnit(now, location, lvl, argsSize);
+                auto unit = makeUnit(now, lvl, argsSize);
                 auto& entry = *reinterpret_cast<LogEntry*>(&unit[0]);
                 detail::Destructor<LogEntry> entryDtor(&entry);
                 
                 entry.fmtPtr = &fmt[0];
                 entry.argsN = sizeof...(Args);
                 
-                auto written = MetaCodec::totalSerialize(&entry.data, std::forward<Args>(args)...);
+                auto written = MetaCodec::totalSerialize(&entry.data,
+                    std::forward<Location>(location), std::forward<Args>(args)...);
+                
                 if(entry.argsN != 0 && written == 0)
                     return;
                 
@@ -844,19 +808,13 @@ namespace Ax { namespace Logger {
                 entryDtor.disable();
             }
             
-            template <LEVEL lvl>
-            [[deprecated("TODO: apply filter")]]
-            ProxyStream<lvl> stream(const std::string& location) {
-                // TODO: filter by logLevel_ before stream construction
-                return {this, location};
-            }
-            
         private:
             const Config cfg_;
             const std::regex fmtSpec_;
             std::atomic<LEVEL> logLevel_;
             
-            std::mutex queueMtx_;
+            using Mutex = Spinlock;
+            Mutex queueMtx_;
             std::deque<StorageUnit> queue_;
             
             std::mutex transportMtx_;
@@ -957,15 +915,18 @@ namespace Ax { namespace Logger {
                     out << os.str();
                 }
                 
-                out << std::left << " ["
-                    << std::setw(6) << entry.logLevel << "]["
-                    << std::setw(6) << threadIdToString(entry.threadId, 6) << "]["
-                    << std::setw(6) << ThreadName::getName(entry.threadId) << "]["
-                    << entry.location << "] ";
-                
                 auto fmt = entry.fmtPtr;
                 size_t argsLeft = entry.argsN;
                 auto data = reinterpret_cast<const ByteType*>(&entry.data);
+                
+                out << std::left << " ["
+                    << std::setw(6) << entry.logLevel << "]["
+                    << std::setw(6) << threadIdToString(entry.threadId, 6) << "]["
+                    << std::setw(6) << ThreadName::getName(entry.threadId) << "][";
+                
+                // Location:
+                data += MetaCodec::deserialize(data, out);
+                out << "] ";
                 
                 std::cmatch match;
                 bool argsOverflow = false;
@@ -1015,9 +976,9 @@ namespace Ax { namespace Logger {
                 return (total - 1) / sizeof(PodEntry) + 1;
             }
             
-            static StorageUnit makeUnit(SystemClock::time_point when, const char* where, LEVEL lvl, size_t payloadSz) {
+            static StorageUnit makeUnit(SystemClock::time_point when, LEVEL lvl, size_t payloadSz) {
                 auto uptr = std::make_unique<PodEntry[]>(unitsRequired(payloadSz));
-                new(&uptr[0]) LogEntry(when, where, lvl);
+                new(&uptr[0]) LogEntry(when, lvl);
                 return uptr;
             }
             
@@ -1032,10 +993,12 @@ namespace Ax { namespace Logger {
         
     } // detail
     
+    
     using detail::LogTransport;
     using detail::CoutTransport;
     using detail::RotatingFileTransport;
     using detail::TailFileTransport;
+    
     
     inline void addTransport(std::unique_ptr<LogTransport>&& transport, LEVEL lvl) {
         detail::globalLogger().addTransport(std::move(transport), lvl); }
@@ -1046,12 +1009,6 @@ namespace Ax { namespace Logger {
     template <Logger::LEVEL lvl, class... Args>
     inline void print(Args&&... args) {
         detail::globalLogger().print<lvl>(std::forward<Args>(args)...); }
-    
-    /*/! Make it more useful by filter
-    template <Logger::LEVEL lvl>
-    inline decltype(auto) logStream(const std::string& location) {
-        return detail::globalLogger().stream<lvl>(location); }
-    //*/
     
 } // Logger
 } // Ax
